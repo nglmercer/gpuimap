@@ -143,7 +143,7 @@ impl MapView {
                     self.location_state = LocationState::Unavailable(error);
                 }
                 match self.source.current_position() {
-                    Ok(fix) => self.apply_fix(fix),
+                    Ok(fix) => self.center_on_fix(fix),
                     Err(error) => self.location_state = LocationState::Unavailable(error),
                 }
             }
@@ -224,6 +224,13 @@ impl MapView {
             self.camera.set_center(fix.position);
             self.request_visible_tiles();
         }
+    }
+
+    fn center_on_fix(&mut self, fix: LocationFix) {
+        let position = fix.position;
+        self.apply_fix(fix);
+        self.camera.set_center(position);
+        self.request_visible_tiles();
     }
 
     fn request_visible_tiles(&mut self) {

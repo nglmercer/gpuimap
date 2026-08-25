@@ -9,10 +9,12 @@ GPUI UI
 Application state
   ├── MapCamera / Viewport / FollowMode
   ├── location::LocationFix
-  └── map-tiles::TileScheduler
-        ├── memory cache
-        ├── disk cache
-        └── provider + HTTP workers
+  └── map-tiles::TileService
+        └── map-tiles::TileScheduler
+              ├── generation-aware bounded queue
+              ├── memory cache
+              ├── fresh/conditional disk cache
+              └── provider + HTTP workers
 
 map-core
   └── pure coordinate, projection, camera, and tile-selection math
@@ -31,4 +33,6 @@ location → map-core
 ```
 
 The map engine never calls a platform API and no worker calls `render()` or owns a GPUI entity.
-
+`MapView` only consumes the provider-independent `TileService` boundary, so a
+URL-template or local provider can be selected without changing presentation
+code.

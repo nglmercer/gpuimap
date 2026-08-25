@@ -38,15 +38,16 @@ pub fn world_to_geo(point: WorldPoint, zoom: f64) -> GeoPoint {
 }
 
 /// Converts a point to a standard integer XYZ tile coordinate.
-pub fn geo_to_tile(point: GeoPoint, zoom: u8) -> TileCoordinate {
-    let count = TileCoordinate::tile_count(zoom).unwrap_or(u32::MAX);
+pub fn geo_to_tile(point: GeoPoint, zoom: u8) -> Result<TileCoordinate, crate::CoordinateError> {
+    let count =
+        TileCoordinate::tile_count(zoom).ok_or(crate::CoordinateError::ZoomOutOfRange { zoom })?;
     let world = geo_to_world(point, f64::from(zoom));
     let size = world_size(f64::from(zoom));
     let x = (((world.x / size) * f64::from(count)).floor() as i64).clamp(0, i64::from(count) - 1);
     let y = ((world.y / size) * f64::from(count)).floor() as i64;
 
     TileCoordinate::from_wrapped(x, y.clamp(0, i64::from(count) - 1), zoom)
-        .unwrap_or_else(|| TileCoordinate::new(0, 0, zoom))
+        .ok_or(crate::CoordinateError::ZoomOutOfRange { zoom })
 }
 
 /// Returns the top-left world pixel of a tile at its own integer zoom.
@@ -96,15 +97,33 @@ mod tests {
     #[test]
     fn tile_edges_match_xyz() {
         assert_eq!(
-            geo_to_tile(GeoPoint::new(0.0, -180.0), 2),
+            geo_to_tile(GeoPoint::new(0.0, -180.0), 2).expect("valid zoom"),
             TileCoordinate::new(0, 2, 2)
         );
         assert_eq!(
-            geo_to_tile(GeoPoint::new(0.0, 180.0), 2),
+            geo_to_tile(GeoPoint::new(0.0, 180.0), 2).expect("valid zoom"),
             TileCoordinate::new(3, 2, 2)
         );
-        assert_eq!(geo_to_tile(GeoPoint::new(MAX_LATITUDE, 0.0), 2).y, 0);
-        assert_eq!(geo_to_tile(GeoPoint::new(MIN_LATITUDE, 0.0), 2).y, 3);
+        assert_eq!(
+            geo_to_tile(GeoPoint::new(MAX_LATITUDE, 0.0), 2)
+                .expect("valid zoom")
+                .y,
+            0
+        );
+        assert_eq!(
+            geo_to_tile(GeoPoint::new(MIN_LATITUDE, 0.0), 2)
+                .expect("valid zoom")
+                .y,
+            3
+        );
+    }
+
+    #[test]
+    fn tile_conversion_rejects_unsupported_zoom() {
+        assert!(matches!(
+            geo_to_tile(GeoPoint::new(0.0, 0.0), 32),
+            Err(crate::CoordinateError::ZoomOutOfRange { zoom: 32 })
+        ));
     }
 
     #[test]

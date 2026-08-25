@@ -13,7 +13,7 @@ use location::{
     LocationState, PermissionResultSink, PermissionStatus,
 };
 use map_core::{DEFAULT_ZOOM, GeoPoint, MapCamera, ScreenPoint, TileCoordinate, Viewport};
-use map_tiles::{OpenStreetMapProvider, TilePriority, TileProvider, TileResult, TileScheduler};
+use map_tiles::{TileFormat, TileGeneration, TilePriority, TileResult, TileService};
 
 use crate::toolbar;
 
@@ -36,7 +36,8 @@ pub struct MapView {
     pub location: Option<LocationFix>,
     pub location_state: LocationState,
     pub follow_mode: FollowMode,
-    scheduler: TileScheduler<OpenStreetMapProvider>,
+    scheduler: Box<dyn TileService>,
+    tile_generation: TileGeneration,
     source: Box<dyn LocationSource>,
     location_sink: LocationSink,
     location_rx: mpsc::Receiver<LocationEvent>,
@@ -49,11 +50,10 @@ pub struct MapView {
 }
 
 impl MapView {
-    pub fn new(
-        scheduler: TileScheduler<OpenStreetMapProvider>,
-        source: Box<dyn LocationSource>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new<S>(scheduler: S, source: Box<dyn LocationSource>, cx: &mut Context<Self>) -> Self
+    where
+        S: TileService + 'static,
+    {
         let (location_tx, location_rx) = mpsc::channel();
         let location_sink: LocationSink = Arc::new(move |event| {
             let _ = location_tx.send(event);
@@ -70,7 +70,8 @@ impl MapView {
             location: None,
             location_state: LocationState::Disabled,
             follow_mode: FollowMode::Off,
-            scheduler,
+            scheduler: Box::new(scheduler),
+            tile_generation: TileGeneration::default(),
             source,
             location_sink,
             location_rx,
@@ -81,7 +82,7 @@ impl MapView {
             last_drag_position: None,
             center_on_next_fix: false,
         };
-        view.request_visible_tiles();
+        view.viewport_changed();
 
         // Polling is non-blocking: tile workers and platform callbacks do all
         // I/O elsewhere, while this short foreground task only transfers ready
@@ -106,7 +107,7 @@ impl MapView {
 
     pub fn zoom_by(&mut self, delta: f64, cx: &mut Context<Self>) {
         self.camera.zoom_by(delta);
-        self.request_visible_tiles();
+        self.viewport_changed();
         cx.notify();
     }
 
@@ -116,7 +117,7 @@ impl MapView {
             DEFAULT_ZOOM,
         );
         self.follow_mode = FollowMode::Off;
-        self.request_visible_tiles();
+        self.viewport_changed();
         cx.notify();
     }
 
@@ -129,7 +130,7 @@ impl MapView {
             && let Some(fix) = &self.location
         {
             self.camera.set_center(fix.position);
-            self.request_visible_tiles();
+            self.viewport_changed();
         }
         cx.notify();
     }
@@ -180,15 +181,29 @@ impl MapView {
 
     fn consume_background_results(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
-        while let Some(TileResult { tile, result, .. }) = self.scheduler.try_recv() {
+        let visible_set: HashSet<_> = self
+            .camera
+            .visible_tiles(self.viewport)
+            .into_iter()
+            .collect();
+        while let Some(TileResult {
+            tile,
+            generation,
+            result,
+            ..
+        }) = self.scheduler.try_recv()
+        {
+            if generation != self.tile_generation || !visible_set.contains(&tile) {
+                continue;
+            }
             self.requested.remove(&tile);
             match result {
                 Ok(data) => {
-                    let format = data
-                        .content_type
-                        .as_deref()
-                        .and_then(ImageFormat::from_mime_type)
-                        .unwrap_or(ImageFormat::Png);
+                    let format = match data.format {
+                        TileFormat::Png => ImageFormat::Png,
+                        TileFormat::Jpeg => ImageFormat::Jpeg,
+                        TileFormat::Webp => ImageFormat::Webp,
+                    };
                     self.images.insert(
                         tile,
                         Arc::new(Image::from_bytes(format, data.bytes().to_vec())),
@@ -275,8 +290,15 @@ impl MapView {
         self.center_on_next_fix = false;
         if should_center {
             self.camera.set_center(fix.position);
-            self.request_visible_tiles();
+            self.viewport_changed();
         }
+    }
+
+    fn viewport_changed(&mut self) {
+        self.tile_generation = self.scheduler.begin_viewport();
+        self.requested.clear();
+        self.failed.clear();
+        self.request_visible_tiles();
     }
 
     fn request_visible_tiles(&mut self) {
@@ -295,7 +317,10 @@ impl MapView {
             {
                 continue;
             }
-            if self.scheduler.request(tile, TilePriority::VISIBLE) {
+            if self
+                .scheduler
+                .request(tile, TilePriority::VISIBLE, self.tile_generation)
+            {
                 self.requested.insert(tile);
             }
         }
@@ -387,7 +412,7 @@ impl Render for MapView {
             && viewport != self.viewport
         {
             self.viewport = viewport;
-            self.request_visible_tiles();
+            self.viewport_changed();
         }
 
         let tiles = self
@@ -396,7 +421,7 @@ impl Render for MapView {
             .into_iter()
             .map(|tile| self.render_tile(tile));
         let overlays = self.render_location_overlay();
-        let attribution_text = self.scheduler.provider().attribution().to_owned();
+        let attribution_text = self.scheduler.attribution().to_owned();
         let attribution = div()
             .absolute()
             .left(px(8.0))
@@ -449,7 +474,7 @@ impl Render for MapView {
                         },
                         this.viewport,
                     );
-                    this.request_visible_tiles();
+                    this.viewport_changed();
                     cx.notify();
                 }
             }))
@@ -473,7 +498,7 @@ impl Render for MapView {
                     cursor,
                     this.viewport,
                 );
-                this.request_visible_tiles();
+                this.viewport_changed();
                 cx.notify();
             }))
             .children(tiles)

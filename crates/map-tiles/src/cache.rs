@@ -6,7 +6,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use map_core::TileCoordinate;
@@ -54,6 +54,16 @@ impl MemoryTileCache {
         Some(value)
     }
 
+    pub fn get_fresh(
+        &self,
+        namespace: &str,
+        tile: TileCoordinate,
+        now: SystemTime,
+    ) -> Option<Arc<TileData>> {
+        self.get(namespace, tile)
+            .filter(|data| data.metadata.is_fresh(now))
+    }
+
     pub fn insert(&self, namespace: &str, tile: TileCoordinate, data: Arc<TileData>) {
         if self.capacity == 0 {
             return;
@@ -94,15 +104,41 @@ fn touch(order: &mut VecDeque<TileKey>, key: &TileKey) {
     order.push_front(key.clone());
 }
 
+/// Limits for the persistent tile cache. Entries older than `max_age` are
+/// removed, and the oldest entries are evicted until `max_bytes` is met.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiskCachePolicy {
+    pub max_bytes: u64,
+    pub max_age: Duration,
+}
+
+impl Default for DiskCachePolicy {
+    fn default() -> Self {
+        Self {
+            max_bytes: 512 * 1024 * 1024,
+            max_age: Duration::from_secs(30 * 24 * 60 * 60),
+        }
+    }
+}
+
 /// Persistent cache for one tile-provider namespace.
 #[derive(Clone, Debug)]
 pub struct DiskTileCache {
     root: PathBuf,
     namespace: String,
+    policy: DiskCachePolicy,
 }
 
 impl DiskTileCache {
     pub fn new(paths: &CachePaths, namespace: &str) -> Result<Self, TileError> {
+        Self::new_with_policy(paths, namespace, DiskCachePolicy::default())
+    }
+
+    pub fn new_with_policy(
+        paths: &CachePaths,
+        namespace: &str,
+        policy: DiskCachePolicy,
+    ) -> Result<Self, TileError> {
         let root = paths
             .tile_namespace(namespace)
             .map_err(|error| TileError::Cache(error.to_string()))?;
@@ -110,6 +146,7 @@ impl DiskTileCache {
         Ok(Self {
             root,
             namespace: namespace.to_owned(),
+            policy,
         })
     }
 
@@ -119,6 +156,10 @@ impl DiskTileCache {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn policy(&self) -> DiskCachePolicy {
+        self.policy
     }
 
     pub fn get(&self, tile: TileCoordinate) -> Result<Option<TileData>, TileError> {
@@ -131,10 +172,20 @@ impl DiskTileCache {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let metadata = read_metadata(&path.with_extension("meta"))?;
+        let metadata_path = path.with_extension("meta");
+        let mut metadata = read_metadata(&metadata_path)?;
+        metadata.last_accessed_at = Some(SystemTime::now());
+        // A read-only cache remains usable; access timestamps only improve
+        // future LRU decisions and are intentionally best-effort.
+        let _ = write_metadata(&metadata_path, &metadata);
         let content_type = image::guess_format(&bytes)
             .ok()
-            .map(|format| format.to_mime_type().to_owned());
+            .and_then(|format| match format {
+                image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP => {
+                    Some(format.to_mime_type().to_owned())
+                }
+                _ => None,
+            });
         TileData::from_bytes(bytes, content_type, metadata).map(Some)
     }
 
@@ -154,8 +205,40 @@ impl DiskTileCache {
             metadata_path.with_extension(format!("meta.tmp-{}-{nonce}", std::process::id()));
         fs::write(&temporary, data.bytes())?;
         replace_file(&temporary, &path)?;
-        write_metadata(&metadata_temporary, &data.metadata)?;
+        let mut metadata = data.metadata.clone();
+        metadata.last_accessed_at = Some(SystemTime::now());
+        write_metadata(&metadata_temporary, &metadata)?;
         replace_file(&metadata_temporary, &metadata_path)?;
+
+        // Cache maintenance is deliberately non-fatal for a successful tile
+        // download. A full or read-only cache must not blank the map.
+        let _ = self.evict();
+        Ok(())
+    }
+
+    /// Runs age and size eviction immediately. Normal inserts invoke this
+    /// automatically, while an application may also call it at startup.
+    pub fn evict(&self) -> Result<(), TileError> {
+        let mut entries = Vec::new();
+        collect_entries(&self.root, &mut entries)?;
+        entries.sort_by_key(|entry: &DiskEntry| entry.last_used);
+
+        let mut total_bytes = entries
+            .iter()
+            .map(|entry| entry.bytes.saturating_add(entry.metadata_bytes))
+            .sum::<u64>();
+        let now = SystemTime::now();
+        for entry in entries {
+            let expired = now
+                .duration_since(entry.last_used)
+                .is_ok_and(|age| age > self.policy.max_age);
+            if !expired && total_bytes <= self.policy.max_bytes {
+                break;
+            }
+
+            remove_entry(&entry)?;
+            total_bytes = total_bytes.saturating_sub(entry.bytes + entry.metadata_bytes);
+        }
         Ok(())
     }
 
@@ -164,6 +247,66 @@ impl DiskTileCache {
             .join(tile.zoom.to_string())
             .join(tile.x.to_string())
             .join(format!("{}.png", tile.y))
+    }
+}
+
+#[derive(Debug)]
+struct DiskEntry {
+    tile_path: PathBuf,
+    metadata_path: PathBuf,
+    bytes: u64,
+    metadata_bytes: u64,
+    last_used: SystemTime,
+}
+
+fn collect_entries(root: &Path, entries: &mut Vec<DiskEntry>) -> Result<(), TileError> {
+    for directory_entry in fs::read_dir(root)? {
+        let directory_entry = directory_entry?;
+        let path = directory_entry.path();
+        let file_type = directory_entry.file_type()?;
+        if file_type.is_dir() {
+            collect_entries(&path, entries)?;
+            continue;
+        }
+        if !file_type.is_file()
+            || path.extension().and_then(|extension| extension.to_str()) != Some("png")
+        {
+            continue;
+        }
+
+        let metadata_path = path.with_extension("meta");
+        let file_metadata = fs::metadata(&path)?;
+        let metadata_file_size = fs::metadata(&metadata_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let cached_metadata = read_metadata(&metadata_path).unwrap_or_default();
+        let last_used = cached_metadata
+            .last_accessed_at
+            .or(cached_metadata.downloaded_at)
+            .or_else(|| file_metadata.modified().ok())
+            .unwrap_or(UNIX_EPOCH);
+        entries.push(DiskEntry {
+            tile_path: path,
+            metadata_path,
+            bytes: file_metadata.len(),
+            metadata_bytes: metadata_file_size,
+            last_used,
+        });
+    }
+    Ok(())
+}
+
+fn remove_entry(entry: &DiskEntry) -> Result<(), TileError> {
+    remove_if_present(&entry.tile_path)?;
+    remove_if_present(&entry.metadata_path)?;
+    Ok(())
+}
+
+fn remove_if_present(path: &Path) -> Result<(), TileError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -188,6 +331,15 @@ fn write_metadata(path: &Path, metadata: &TileMetadata) -> Result<(), TileError>
                 time.duration_since(UNIX_EPOCH)
                     .ok()
                     .map(|duration| duration.as_secs().to_string())
+            }),
+        ),
+        metadata_line(
+            "last_accessed_at",
+            metadata.last_accessed_at.and_then(|time| {
+                time.duration_since(UNIX_EPOCH)
+                    .ok()
+                    .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+                    .map(|nanos| nanos.to_string())
             }),
         ),
     ]
@@ -227,6 +379,11 @@ fn read_metadata(path: &Path) -> Result<TileMetadata, TileError> {
                     .and_then(|value| value.parse::<u64>().ok())
                     .map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds));
             }
+            "last_accessed_at" => {
+                metadata.last_accessed_at = value
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(|nanos| UNIX_EPOCH + Duration::from_nanos(nanos));
+            }
             _ => {}
         }
     }
@@ -254,6 +411,8 @@ mod tests {
                 Some("image/png".into()),
                 TileMetadata {
                     etag: Some(value.to_string()),
+                    cache_control: Some("max-age=3600".into()),
+                    downloaded_at: Some(SystemTime::now()),
                     ..Default::default()
                 },
             )
@@ -298,6 +457,7 @@ mod tests {
         assert_eq!(loaded.content_type.as_deref(), Some("image/png"));
         assert_eq!(loaded.metadata.etag.as_deref(), Some("abc"));
         assert_eq!(loaded.metadata.downloaded_at, data.metadata.downloaded_at);
+        assert!(loaded.metadata.last_accessed_at.is_some());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -319,6 +479,35 @@ mod tests {
             cache.insert(invalid, &data),
             Err(TileError::InvalidCoordinate)
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disk_cache_evicts_oldest_entry_when_size_is_exceeded() {
+        let root = std::env::temp_dir().join(format!(
+            "gpuimap-cache-eviction-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let paths = CachePaths::from_root(&root);
+        let first = TileCoordinate::new(0, 0, 2);
+        let second = TileCoordinate::new(1, 0, 2);
+        let data = TileData::from_bytes(png(), Some("image/png".into()), TileMetadata::default())
+            .expect("fixture is a PNG");
+        let one_tile_bytes = data.bytes().len() as u64;
+        let cache = DiskTileCache::new_with_policy(
+            &paths,
+            "test",
+            DiskCachePolicy {
+                max_bytes: one_tile_bytes + 256,
+                max_age: Duration::from_secs(3600),
+            },
+        )
+        .expect("cache directory");
+        cache.insert(first, &data).expect("first tile");
+        cache.insert(second, &data).expect("second tile");
+        assert!(cache.get(first).expect("first lookup").is_none());
+        assert!(cache.get(second).expect("second lookup").is_some());
         let _ = fs::remove_dir_all(root);
     }
 }

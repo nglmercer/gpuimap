@@ -92,16 +92,21 @@ fn safe_component(component: &str) -> Result<String, StorageError> {
         return Err(StorageError::InvalidComponent(component.to_owned()));
     }
 
-    Ok(component
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect())
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(component.len());
+    for byte in component.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            encoded.push(byte as char);
+        } else {
+            // `~` is not emitted literally, so escaped bytes cannot collide
+            // with a namespace that already contains a sequence such as
+            // `~20`.
+            encoded.push('~');
+            encoded.push(HEX[usize::from(byte >> 4)] as char);
+            encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+        }
+    }
+    Ok(encoded)
 }
 
 #[cfg(test)]
@@ -133,7 +138,15 @@ mod tests {
         let paths = CachePaths::from_root("test-cache");
         assert_eq!(
             paths.tile_namespace("provider name").expect("sanitized"),
-            PathBuf::from("test-cache/tiles/provider_name")
+            PathBuf::from("test-cache/tiles/provider~20name")
         );
+    }
+
+    #[test]
+    fn unusual_names_do_not_collide() {
+        let paths = CachePaths::from_root("test-cache");
+        let first = paths.tile_namespace("a b").expect("valid namespace");
+        let second = paths.tile_namespace("a?b").expect("valid namespace");
+        assert_ne!(first, second);
     }
 }

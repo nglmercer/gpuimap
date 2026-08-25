@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows / ${{ matrix.check }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - check: fmt
+            command: cargo fmt --all --check
+          - check: test
+            command: cargo test --workspace
+          - check: clippy
+            command: cargo clippy --workspace --all-targets --all-features -- -D warnings
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: >-
+          rustup toolchain install 1.97.1-x86_64-pc-windows-msvc
+          --profile minimal --component rustfmt --component clippy
+
+      - name: Run ${{ matrix.check }}
+        shell: pwsh
+        run: ${{ matrix.command }}
+
+  audit:
+    name: Security / cargo-audit
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: >-
+          rustup toolchain install 1.97.1-x86_64-pc-windows-msvc
+          --profile minimal
+
+      - name: Install cargo-audit
+        shell: pwsh
+        run: cargo install cargo-audit --locked
+
+      - name: Audit dependencies
+        shell: pwsh
+        run: cargo audit

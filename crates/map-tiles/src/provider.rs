@@ -1,11 +1,24 @@
 use map_core::TileCoordinate;
+use sha2::{Digest, Sha256};
 
 /// Describes how an application obtains and attributes raster tiles.
 pub trait TileProvider: Send + Sync + 'static {
     fn tile_url(&self, tile: TileCoordinate) -> String;
     fn attribution(&self) -> &str;
     fn max_zoom(&self) -> u8;
+    /// Stable, provider-specific persistent-cache identity.
     fn cache_namespace(&self) -> &str;
+}
+
+fn stable_namespace(prefix: &str, identity: &str) -> String {
+    let digest = Sha256::digest(identity.as_bytes());
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    format!("{prefix}-{encoded}")
 }
 
 /// OpenStreetMap's standard raster provider, useful for development.
@@ -21,9 +34,10 @@ pub struct OpenStreetMapProvider {
 
 impl OpenStreetMapProvider {
     pub fn new(base_url: impl Into<String>) -> Self {
+        let base_url = base_url.into().trim_end_matches('/').to_owned();
         Self {
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
-            namespace: "osm".to_owned(),
+            namespace: stable_namespace("osm", &base_url),
+            base_url,
         }
     }
 }
@@ -68,11 +82,15 @@ impl UrlTemplateProvider {
         max_zoom: u8,
         namespace: impl Into<String>,
     ) -> Self {
+        let template = template.into();
+        let attribution = attribution.into();
+        let namespace = namespace.into();
+        let identity = format!("{namespace}\0{template}\0{attribution}\0{max_zoom}");
         Self {
-            template: template.into(),
-            attribution: attribution.into(),
+            namespace: stable_namespace("url", &identity),
+            template,
+            attribution,
             max_zoom,
-            namespace: namespace.into(),
         }
     }
 }
@@ -111,11 +129,14 @@ pub struct LocalTileProvider {
 
 impl LocalTileProvider {
     pub fn new(root: impl Into<std::path::PathBuf>, attribution: impl Into<String>) -> Self {
+        let root = root.into();
+        let attribution = attribution.into();
+        let identity = format!("{}\0{attribution}", root.to_string_lossy());
         Self {
-            root: root.into(),
-            attribution: attribution.into(),
+            namespace: stable_namespace("local", &identity),
+            root,
+            attribution,
             max_zoom: 19,
-            namespace: "local".to_owned(),
         }
     }
 
@@ -157,6 +178,10 @@ mod tests {
             "https://tile.openstreetmap.org/12/1204/1534.png"
         );
         assert_eq!(provider.max_zoom(), 19);
+        assert_ne!(
+            provider.cache_namespace(),
+            OpenStreetMapProvider::new("https://tiles.example.test").cache_namespace()
+        );
     }
 
     #[test]
@@ -171,5 +196,22 @@ mod tests {
             provider.tile_url(TileCoordinate::new(4, 5, 6)),
             "https://example.test/6/4/5.jpg"
         );
+    }
+
+    #[test]
+    fn equivalent_provider_configuration_has_stable_namespace() {
+        let first = UrlTemplateProvider::new(
+            "https://example.test/{z}/{x}/{y}.jpg",
+            "Example",
+            18,
+            "example",
+        );
+        let second = UrlTemplateProvider::new(
+            "https://example.test/{z}/{x}/{y}.jpg",
+            "Example",
+            18,
+            "example",
+        );
+        assert_eq!(first.cache_namespace(), second.cache_namespace());
     }
 }

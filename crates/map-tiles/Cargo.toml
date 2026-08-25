@@ -11,9 +11,10 @@ name = "map_tiles"
 path = "src/lib.rs"
 
 [dependencies]
+httpdate.workspace = true
 image.workspace = true
 map-core.workspace = true
 reqwest.workspace = true
+sha2.workspace = true
 storage.workspace = true
 thiserror.workspace = true
-

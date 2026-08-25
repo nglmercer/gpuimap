@@ -119,6 +119,7 @@ impl fmt::Display for TileCoordinate {
 pub enum CoordinateError {
     NonFinite,
     LatitudeOutOfRange { latitude: f64 },
+    ZoomOutOfRange { zoom: u8 },
 }
 
 impl fmt::Display for CoordinateError {
@@ -129,6 +130,12 @@ impl fmt::Display for CoordinateError {
                 write!(
                     formatter,
                     "latitude {latitude} is outside Web Mercator bounds"
+                )
+            }
+            Self::ZoomOutOfRange { zoom } => {
+                write!(
+                    formatter,
+                    "zoom {zoom} is outside the supported 0..32 range"
                 )
             }
         }

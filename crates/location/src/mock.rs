@@ -62,8 +62,10 @@ impl LocationSource for MockLocationSource {
     }
 
     fn current_position(&mut self) -> Result<LocationFix, LocationError> {
-        if self.permission == PermissionStatus::Denied {
-            return Err(LocationError::PermissionDenied);
+        match self.permission {
+            PermissionStatus::Denied => return Err(LocationError::PermissionDenied),
+            PermissionStatus::Unspecified => return Err(LocationError::Unavailable),
+            PermissionStatus::Allowed => {}
         }
         self.fix.clone().ok_or(LocationError::Unavailable)
     }

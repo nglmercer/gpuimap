@@ -61,6 +61,9 @@ pub fn render_toolbar(map: Entity<MapView>) -> impl IntoElement {
         .child(button("◎ Locate me", map.clone(), |view, cx| {
             view.locate_me(cx);
         }))
+        .child(button("Location settings", map.clone(), |view, cx| {
+            view.open_location_settings(cx);
+        }))
         .child(button("Follow", map, |view, cx| {
             view.toggle_follow(cx);
         }))

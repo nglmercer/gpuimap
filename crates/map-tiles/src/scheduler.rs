@@ -93,6 +93,7 @@ where
 {
     inner: Arc<SchedulerInner<P, F>>,
     worker_handles: Option<Vec<JoinHandle<()>>>,
+    workers_available: bool,
 }
 
 impl<P, F> TileScheduler<P, F>
@@ -139,12 +140,14 @@ where
 
         Self {
             inner,
+            workers_available: !worker_handles.is_empty(),
             worker_handles: Some(worker_handles),
         }
     }
 
     pub fn request(&self, tile: TileCoordinate, priority: i32) -> bool {
-        if !tile.is_valid() {
+        if !self.workers_available || !tile.is_valid() || tile.zoom > self.inner.provider.max_zoom()
+        {
             return false;
         }
 
@@ -240,6 +243,7 @@ where
         Self {
             inner: Arc::clone(&self.inner),
             worker_handles: None,
+            workers_available: self.workers_available,
         }
     }
 }
@@ -301,7 +305,9 @@ where
                     (TileSource::Disk, Ok(data))
                 }
                 Ok(None) => fetch_from_network(&inner, request.tile),
-                Err(error) => (TileSource::Disk, Err(error)),
+                // A damaged, read-only, or otherwise inaccessible local
+                // cache must not prevent a fresh network tile from loading.
+                Err(_) => fetch_from_network(&inner, request.tile),
             }
         } else {
             fetch_from_network(&inner, request.tile)
@@ -445,5 +451,14 @@ mod tests {
         assert!(scheduler.request(tile, TilePriority::VISIBLE));
         assert!(!scheduler.request(tile, TilePriority::VISIBLE));
         assert!(scheduler.recv_timeout(Duration::from_secs(2)).is_some());
+    }
+
+    #[test]
+    fn requests_above_provider_zoom_are_rejected() {
+        let provider =
+            UrlTemplateProvider::new("https://example/{z}/{x}/{y}.png", "Example", 2, "test");
+        let scheduler = TileScheduler::new(provider, FakeFetcher, 8, None, 1);
+        assert!(!scheduler.request(TileCoordinate::new(0, 0, 3), TilePriority::VISIBLE));
+        assert_eq!(scheduler.pending_count(), 0);
     }
 }

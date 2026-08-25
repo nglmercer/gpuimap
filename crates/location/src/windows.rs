@@ -3,23 +3,28 @@
 //! This module is compiled only for Windows. No Windows types escape this
 //! module: callers receive the platform-neutral `LocationFix` and events.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use windows::{
-    Devices::Geolocation::{GeolocationAccessStatus, Geolocator, PositionChangedEventArgs},
+    Devices::Geolocation::{
+        GeolocationAccessStatus, Geolocator, PositionChangedEventArgs, PositionStatus,
+        StatusChangedEventArgs,
+    },
     Foundation::TypedEventHandler,
 };
 
 use crate::{
-    LocationBackend, LocationError, LocationEvent, LocationFix, LocationSink, LocationSource,
-    LocationState, PermissionStatus,
+    LocationBackend, LocationError, LocationEvent, LocationFix, LocationFixSink, LocationSink,
+    LocationSource, LocationState, PermissionResultSink, PermissionStatus,
 };
 
 pub struct WindowsLocationSource {
     locator: Option<Geolocator>,
     position_token: Option<i64>,
+    status_token: Option<i64>,
     sink: Option<LocationSink>,
-    permission: PermissionStatus,
+    permission: Arc<Mutex<PermissionStatus>>,
+    last_fix: Arc<Mutex<Option<LocationFix>>>,
 }
 
 impl WindowsLocationSource {
@@ -27,8 +32,23 @@ impl WindowsLocationSource {
         Self {
             locator: None,
             position_token: None,
+            status_token: None,
             sink: None,
-            permission: PermissionStatus::Unspecified,
+            permission: Arc::new(Mutex::new(PermissionStatus::Unspecified)),
+            last_fix: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn permission_status(&self) -> PermissionStatus {
+        self.permission
+            .lock()
+            .map(|permission| *permission)
+            .unwrap_or(PermissionStatus::Unspecified)
+    }
+
+    fn set_permission_status(&self, permission: PermissionStatus) {
+        if let Ok(mut current) = self.permission.lock() {
+            *current = permission;
         }
     }
 
@@ -60,38 +80,86 @@ impl LocationSource for WindowsLocationSource {
             .map_err(backend_error)?
             .join()
             .map_err(backend_error)?;
-        let permission = match result {
-            GeolocationAccessStatus::Allowed => PermissionStatus::Allowed,
-            GeolocationAccessStatus::Denied => PermissionStatus::Denied,
-            _ => PermissionStatus::Unspecified,
-        };
-        self.permission = permission;
+        let permission = permission_from_access(result);
+        self.set_permission_status(permission);
         if permission == PermissionStatus::Allowed {
             let _ = self.ensure_locator()?;
         }
         Ok(permission)
     }
 
+    fn request_permission_async(
+        &mut self,
+        sink: PermissionResultSink,
+    ) -> Result<(), LocationError> {
+        let permission_state = Arc::clone(&self.permission);
+        Geolocator::RequestAccessAsync()
+            .map_err(backend_error)?
+            .when(move |result| {
+                let result = result.map(permission_from_access).map_err(backend_error);
+                if let Ok(permission) = &result
+                    && let Ok(mut current) = permission_state.lock()
+                {
+                    *current = *permission;
+                }
+                sink(result);
+            })
+            .map_err(backend_error)
+    }
+
     fn current_position(&mut self) -> Result<LocationFix, LocationError> {
-        if self.permission != PermissionStatus::Allowed {
+        if self.permission_status() != PermissionStatus::Allowed {
             return Err(LocationError::PermissionDenied);
         }
-        let position = self
-            .ensure_locator()?
+        self.last_fix
+            .lock()
+            .ok()
+            .and_then(|fix| fix.clone())
+            .ok_or(LocationError::NoData)
+    }
+
+    fn request_current_position_async(
+        &mut self,
+        sink: LocationFixSink,
+    ) -> Result<(), LocationError> {
+        if self.permission_status() != PermissionStatus::Allowed {
+            return Err(LocationError::PermissionDenied);
+        }
+        let locator = self.ensure_locator()?.clone();
+        let last_fix = Arc::clone(&self.last_fix);
+        locator
             .GetGeopositionAsync()
             .map_err(backend_error)?
-            .join()
-            .map_err(backend_error)?;
-        fix_from_position(&position)
+            .when(move |result| {
+                let result = result
+                    .map_err(backend_error)
+                    .and_then(|position| fix_from_position(&position));
+                if let Ok(fix) = &result
+                    && let Ok(mut current) = last_fix.lock()
+                {
+                    *current = Some(fix.clone());
+                }
+                sink(result);
+            })
+            .map_err(backend_error)
+    }
+
+    fn open_location_settings(&mut self) -> Result<(), LocationError> {
+        std::process::Command::new("explorer.exe")
+            .arg("ms-settings:privacy-location")
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| LocationError::Backend(error.to_string()))
     }
 
     fn start_updates(&mut self, sink: LocationSink) -> Result<(), LocationError> {
-        if self.permission != PermissionStatus::Allowed {
+        if self.permission_status() != PermissionStatus::Allowed {
             return Err(LocationError::PermissionDenied);
         }
         self.stop_updates();
         let locator = self.ensure_locator()?.clone();
         let event_sink = Arc::clone(&sink);
+        let last_fix = Arc::clone(&self.last_fix);
         let handler =
             TypedEventHandler::<Geolocator, PositionChangedEventArgs>::new(move |_sender, args| {
                 if let Some(args) = args.as_ref() {
@@ -100,7 +168,12 @@ impl LocationSource for WindowsLocationSource {
                         .map_err(backend_error)
                         .and_then(|position| fix_from_position(&position))
                     {
-                        Ok(fix) => event_sink(LocationEvent::Fix(fix)),
+                        Ok(fix) => {
+                            if let Ok(mut current) = last_fix.lock() {
+                                *current = Some(fix.clone());
+                            }
+                            event_sink(LocationEvent::Fix(fix));
+                        }
                         Err(error) => {
                             event_sink(LocationEvent::State(LocationState::Unavailable(error)))
                         }
@@ -108,15 +181,63 @@ impl LocationSource for WindowsLocationSource {
                 }
                 Ok(())
             });
-        let token = locator.PositionChanged(&handler).map_err(backend_error)?;
-        self.position_token = Some(token);
+        let position_token = locator.PositionChanged(&handler).map_err(backend_error)?;
+
+        let status_sink = Arc::clone(&sink);
+        let status_handler =
+            TypedEventHandler::<Geolocator, StatusChangedEventArgs>::new(move |_sender, args| {
+                if let Some(args) = args.as_ref() {
+                    match args.Status().map_err(backend_error) {
+                        Ok(status) => {
+                            if let Some(event) = status_event(status) {
+                                status_sink(event);
+                            }
+                        }
+                        Err(error) => {
+                            status_sink(LocationEvent::State(LocationState::Unavailable(error)))
+                        }
+                    }
+                }
+                Ok(())
+            });
+        let status_token = match locator
+            .StatusChanged(&status_handler)
+            .map_err(backend_error)
+        {
+            Ok(token) => token,
+            Err(error) => {
+                let _ = locator.RemovePositionChanged(position_token);
+                return Err(error);
+            }
+        };
+        let initial_status = match locator.LocationStatus().map_err(backend_error) {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = locator.RemovePositionChanged(position_token);
+                let _ = locator.RemoveStatusChanged(status_token);
+                return Err(error);
+            }
+        };
+
+        self.position_token = Some(position_token);
+        self.status_token = Some(status_token);
         self.sink = Some(sink);
+        if let Some(event) = status_event(initial_status)
+            && let Some(sink) = &self.sink
+        {
+            sink(event);
+        }
         Ok(())
     }
 
     fn stop_updates(&mut self) {
-        if let (Some(locator), Some(token)) = (&self.locator, self.position_token.take()) {
-            let _ = locator.RemovePositionChanged(token);
+        if let Some(locator) = &self.locator {
+            if let Some(token) = self.position_token.take() {
+                let _ = locator.RemovePositionChanged(token);
+            }
+            if let Some(token) = self.status_token.take() {
+                let _ = locator.RemoveStatusChanged(token);
+            }
         }
         self.sink = None;
     }
@@ -164,5 +285,30 @@ fn fix_from_position(
 }
 
 fn backend_error(error: windows::core::Error) -> LocationError {
-    LocationError::Backend(error.to_string())
+    if error.code().0 == 0x8007_05B4u32 as i32 {
+        LocationError::NoData
+    } else {
+        LocationError::Backend(error.to_string())
+    }
+}
+
+fn permission_from_access(status: GeolocationAccessStatus) -> PermissionStatus {
+    match status {
+        GeolocationAccessStatus::Allowed => PermissionStatus::Allowed,
+        GeolocationAccessStatus::Denied => PermissionStatus::Denied,
+        GeolocationAccessStatus::Unspecified => PermissionStatus::Unspecified,
+        _ => PermissionStatus::Unspecified,
+    }
+}
+
+fn status_event(status: PositionStatus) -> Option<LocationEvent> {
+    let state = match status {
+        PositionStatus::Initializing => LocationState::Searching,
+        PositionStatus::NoData => LocationState::Unavailable(LocationError::NoData),
+        PositionStatus::Disabled => LocationState::Unavailable(LocationError::Disabled),
+        PositionStatus::NotAvailable => LocationState::Unavailable(LocationError::NotSupported),
+        PositionStatus::Ready | PositionStatus::NotInitialized => return None,
+        _ => LocationState::Unavailable(LocationError::Unavailable),
+    };
+    Some(LocationEvent::State(state))
 }

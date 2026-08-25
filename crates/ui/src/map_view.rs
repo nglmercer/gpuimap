@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, mpsc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gpui::{
@@ -9,8 +9,8 @@ use gpui::{
     prelude::*, px, rgb, rgba,
 };
 use location::{
-    LocationError, LocationEvent, LocationFix, LocationSink, LocationSource, LocationState,
-    PermissionStatus,
+    LocationError, LocationEvent, LocationFix, LocationFixSink, LocationSink, LocationSource,
+    LocationState, PermissionResultSink, PermissionStatus,
 };
 use map_core::{DEFAULT_ZOOM, GeoPoint, MapCamera, ScreenPoint, TileCoordinate, Viewport};
 use map_tiles::{OpenStreetMapProvider, TilePriority, TileProvider, TileResult, TileScheduler};
@@ -21,6 +21,7 @@ pub const MAP_TOP_OFFSET: f32 = toolbar::TOOLBAR_HEIGHT;
 const STATUS_BAR_HEIGHT: f32 = 28.0;
 const DEFAULT_LATITUDE: f64 = -12.0464;
 const DEFAULT_LONGITUDE: f64 = -77.0428;
+const TILE_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Whether new fixes recenter the camera.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,9 +42,10 @@ pub struct MapView {
     location_rx: mpsc::Receiver<LocationEvent>,
     images: HashMap<TileCoordinate, Arc<Image>>,
     requested: HashSet<TileCoordinate>,
-    failed: HashSet<TileCoordinate>,
+    failed: HashMap<TileCoordinate, Instant>,
     last_tile_error: Option<String>,
     last_drag_position: Option<ScreenPoint>,
+    center_on_next_fix: bool,
 }
 
 impl MapView {
@@ -74,9 +76,10 @@ impl MapView {
             location_rx,
             images: HashMap::new(),
             requested: HashSet::new(),
-            failed: HashSet::new(),
+            failed: HashMap::new(),
             last_tile_error: None,
             last_drag_position: None,
+            center_on_next_fix: false,
         };
         view.request_visible_tiles();
 
@@ -131,31 +134,24 @@ impl MapView {
         cx.notify();
     }
 
-    /// Performs the explicit foreground permission flow, then gets a first
-    /// fix and starts continuous updates. The Windows adapter keeps its
-    /// `RequestAccessAsync` call on this UI action path as required by WinRT.
+    /// Starts the foreground permission flow without blocking the GPUI thread.
+    /// The first fix recenters the map; later fixes only recenter in Follow
+    /// mode.
     pub fn locate_me(&mut self, cx: &mut Context<Self>) {
+        if self.location_state == LocationState::RequestingPermission {
+            return;
+        }
         self.location_state = LocationState::RequestingPermission;
-        match self.source.request_permission() {
-            Ok(PermissionStatus::Allowed) => {
-                self.location_state = LocationState::Searching;
-                if let Err(error) = self.source.start_updates(Arc::clone(&self.location_sink)) {
-                    self.location_state = LocationState::Unavailable(error);
-                }
-                match self.source.current_position() {
-                    Ok(fix) => self.center_on_fix(fix),
-                    Err(error) => self.location_state = LocationState::Unavailable(error),
-                }
-            }
-            Ok(PermissionStatus::Denied) => {
-                self.location_state = LocationState::PermissionDenied;
-            }
-            Ok(PermissionStatus::Unspecified) => {
-                self.location_state = LocationState::Unavailable(LocationError::Unavailable);
-            }
-            Err(error) => {
-                self.location_state = LocationState::Unavailable(error);
-            }
+        self.center_on_next_fix = true;
+        self.source.stop_updates();
+
+        let event_sink = Arc::clone(&self.location_sink);
+        let permission_sink: PermissionResultSink = Arc::new(move |result| {
+            event_sink(LocationEvent::Permission(result));
+        });
+        if let Err(error) = self.source.request_permission_async(permission_sink) {
+            self.center_on_next_fix = false;
+            self.location_state = LocationState::Unavailable(error);
         }
         cx.notify();
     }
@@ -169,6 +165,13 @@ impl MapView {
             LocationState::Available(_) => format!("{}", self.source.backend()),
             LocationState::Unavailable(error) => format!("Unavailable: {error}"),
         }
+    }
+
+    pub fn open_location_settings(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = self.source.open_location_settings() {
+            self.location_state = LocationState::Unavailable(error);
+        }
+        cx.notify();
     }
 
     pub fn loaded_tile_count(&self) -> usize {
@@ -191,9 +194,10 @@ impl MapView {
                         Arc::new(Image::from_bytes(format, data.bytes().to_vec())),
                     );
                     self.failed.remove(&tile);
+                    self.last_tile_error = None;
                 }
                 Err(error) => {
-                    self.failed.insert(tile);
+                    self.failed.insert(tile, Instant::now());
                     self.last_tile_error = Some(error.to_string());
                 }
             }
@@ -205,6 +209,13 @@ impl MapView {
             changed = true;
         }
 
+        // Failed tiles are retried after a short cooldown. This keeps a
+        // temporary network outage from becoming a permanent blank tile while
+        // avoiding a tight retry loop in the foreground poller.
+        if !self.failed.is_empty() {
+            self.request_visible_tiles();
+        }
+
         if changed {
             cx.notify();
         }
@@ -212,32 +223,75 @@ impl MapView {
 
     fn apply_location_event(&mut self, event: LocationEvent) {
         match event {
+            LocationEvent::Permission(result) => self.handle_permission_result(result),
             LocationEvent::Fix(fix) => self.apply_fix(fix),
             LocationEvent::State(state) => self.location_state = state,
         }
     }
 
+    fn handle_permission_result(&mut self, result: Result<PermissionStatus, LocationError>) {
+        match result {
+            Ok(PermissionStatus::Allowed) => self.begin_location_updates(),
+            Ok(PermissionStatus::Denied) => {
+                self.center_on_next_fix = false;
+                self.location_state = LocationState::PermissionDenied;
+            }
+            Ok(PermissionStatus::Unspecified) => {
+                self.center_on_next_fix = false;
+                self.location_state = LocationState::Unavailable(LocationError::Unavailable);
+            }
+            Err(error) => {
+                self.center_on_next_fix = false;
+                self.location_state = LocationState::Unavailable(error);
+            }
+        }
+    }
+
+    fn begin_location_updates(&mut self) {
+        self.location_state = LocationState::Searching;
+        if let Err(error) = self.source.start_updates(Arc::clone(&self.location_sink)) {
+            self.center_on_next_fix = false;
+            self.location_state = LocationState::Unavailable(error);
+            return;
+        }
+
+        let event_sink = Arc::clone(&self.location_sink);
+        let fix_sink: LocationFixSink = Arc::new(move |result| {
+            let event = match result {
+                Ok(fix) => LocationEvent::Fix(fix),
+                Err(error) => LocationEvent::State(LocationState::Unavailable(error)),
+            };
+            event_sink(event);
+        });
+        if let Err(error) = self.source.request_current_position_async(fix_sink) {
+            self.location_state = LocationState::Unavailable(error);
+        }
+    }
+
     fn apply_fix(&mut self, fix: LocationFix) {
+        let should_center = self.follow_mode == FollowMode::Follow || self.center_on_next_fix;
         self.location_state = LocationState::Available(fix.clone());
         self.location = Some(fix.clone());
-        if self.follow_mode == FollowMode::Follow {
+        self.center_on_next_fix = false;
+        if should_center {
             self.camera.set_center(fix.position);
             self.request_visible_tiles();
         }
     }
 
-    fn center_on_fix(&mut self, fix: LocationFix) {
-        let position = fix.position;
-        self.apply_fix(fix);
-        self.camera.set_center(position);
-        self.request_visible_tiles();
-    }
-
     fn request_visible_tiles(&mut self) {
-        for tile in self.camera.visible_tiles(self.viewport) {
+        let visible_tiles = self.camera.visible_tiles(self.viewport);
+        let visible_set: HashSet<_> = visible_tiles.iter().copied().collect();
+        self.images.retain(|tile, _| visible_set.contains(tile));
+        self.requested.retain(|tile| visible_set.contains(tile));
+        self.failed.retain(|tile, failed_at| {
+            visible_set.contains(tile) && failed_at.elapsed() < TILE_RETRY_DELAY
+        });
+
+        for tile in visible_tiles {
             if self.images.contains_key(&tile)
                 || self.requested.contains(&tile)
-                || self.failed.contains(&tile)
+                || self.failed.contains_key(&tile)
             {
                 continue;
             }

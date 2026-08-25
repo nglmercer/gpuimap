@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, VecDeque},
     fs, io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, UNIX_EPOCH},
 };
 
@@ -10,6 +13,8 @@ use map_core::TileCoordinate;
 use storage::CachePaths;
 
 use crate::{TileData, TileError, TileMetadata};
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct TileKey {
@@ -117,6 +122,9 @@ impl DiskTileCache {
     }
 
     pub fn get(&self, tile: TileCoordinate) -> Result<Option<TileData>, TileError> {
+        if !tile.is_valid() {
+            return Err(TileError::InvalidCoordinate);
+        }
         let path = self.tile_path(tile);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -131,15 +139,23 @@ impl DiskTileCache {
     }
 
     pub fn insert(&self, tile: TileCoordinate, data: &TileData) -> Result<(), TileError> {
+        if !tile.is_valid() {
+            return Err(TileError::InvalidCoordinate);
+        }
         let path = self.tile_path(tile);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let temporary = path.with_extension(format!("png.tmp-{}", std::process::id()));
+        let nonce = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = path.with_extension(format!("png.tmp-{}-{nonce}", std::process::id()));
+        let metadata_path = path.with_extension("meta");
+        let metadata_temporary =
+            metadata_path.with_extension(format!("meta.tmp-{}-{nonce}", std::process::id()));
         fs::write(&temporary, data.bytes())?;
         replace_file(&temporary, &path)?;
-        write_metadata(&path.with_extension("meta"), &data.metadata)?;
+        write_metadata(&metadata_temporary, &data.metadata)?;
+        replace_file(&metadata_temporary, &metadata_path)?;
         Ok(())
     }
 
@@ -152,8 +168,10 @@ impl DiskTileCache {
 }
 
 fn replace_file(temporary: &Path, destination: &Path) -> Result<(), io::Error> {
-    if destination.exists() {
-        fs::remove_file(destination)?;
+    match fs::remove_file(destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     fs::rename(temporary, destination)
 }
@@ -280,6 +298,27 @@ mod tests {
         assert_eq!(loaded.content_type.as_deref(), Some("image/png"));
         assert_eq!(loaded.metadata.etag.as_deref(), Some("abc"));
         assert_eq!(loaded.metadata.downloaded_at, data.metadata.downloaded_at);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disk_cache_rejects_coordinates_outside_the_tile_matrix() {
+        let root =
+            std::env::temp_dir().join(format!("gpuimap-cache-invalid-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let paths = CachePaths::from_root(&root);
+        let cache = DiskTileCache::new(&paths, "test").expect("cache directory");
+        let invalid = TileCoordinate::new(4, 0, 2);
+        assert!(matches!(
+            cache.get(invalid),
+            Err(TileError::InvalidCoordinate)
+        ));
+        let data = TileData::from_bytes(png(), Some("image/png".into()), TileMetadata::default())
+            .expect("fixture is a PNG");
+        assert!(matches!(
+            cache.insert(invalid, &data),
+            Err(TileError::InvalidCoordinate)
+        ));
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -5,8 +5,8 @@ mod source;
 
 pub use mock::MockLocationSource;
 pub use source::{
-    LocationBackend, LocationError, LocationEvent, LocationFix, LocationSink, LocationSource,
-    LocationState, PermissionStatus,
+    LocationBackend, LocationError, LocationEvent, LocationFix, LocationFixSink, LocationSink,
+    LocationSource, LocationState, PermissionResultSink, PermissionStatus,
 };
 
 #[cfg(windows)]

@@ -1,0 +1,19 @@
+[package]
+name = "gpuimap-location"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Platform-neutral location domain and Windows Geolocator adapter"
+
+[lib]
+name = "location"
+path = "src/lib.rs"
+
+[dependencies]
+map-core.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Devices_Geolocation", "Foundation"] }
+

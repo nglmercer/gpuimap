@@ -1,0 +1,12 @@
+[package]
+name = "gpuimap-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Platform-aware filesystem paths for gpuimap caches"
+
+[lib]
+name = "storage"
+path = "src/lib.rs"
+

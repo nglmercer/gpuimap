@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/app",
+    "crates/location",
+    "crates/map-core",
+    "crates/map-tiles",
+    "crates/storage",
+    "crates/ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["gpuimap contributors"]
+
+[workspace.dependencies]
+location = { package = "gpuimap-location", path = "crates/location" }
+map-core = { package = "gpuimap-map-core", path = "crates/map-core" }
+map-tiles = { package = "gpuimap-map-tiles", path = "crates/map-tiles" }
+storage = { package = "gpuimap-storage", path = "crates/storage" }
+map-ui = { package = "gpuimap-ui", path = "crates/ui" }
+
+gpui = "=0.2.2"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+reqwest = { version = "0.12.23", default-features = false, features = ["blocking", "rustls-tls"] }
+thiserror = "2.0.17"
+

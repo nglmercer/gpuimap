@@ -1,0 +1,19 @@
+[package]
+name = "gpuimap-map-tiles"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Provider, HTTP, cache, and scheduler layers for gpuimap raster tiles"
+
+[lib]
+name = "map_tiles"
+path = "src/lib.rs"
+
+[dependencies]
+image.workspace = true
+map-core.workspace = true
+reqwest.workspace = true
+storage.workspace = true
+thiserror.workspace = true
+
